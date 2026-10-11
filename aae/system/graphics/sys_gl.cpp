@@ -18,6 +18,10 @@
 #include "glew.h"
 #include "wglew.h"
 #include "win32/win32_private.h"
+#elif defined(AAE_SDL)
+#include <GL/glew.h>
+#include <SDL.h>
+#include "sdl/sdl_window.h"   // sdl_get_window()
 #else
 // Linux: GLEW and GLX. glxew.h pulls <GL/glx.h> itself and must come after
 // glew.h. Xlib is reached only through GLX here - this file never touches a
@@ -35,6 +39,9 @@
 #ifdef _WIN32
 static HDC   hDC = nullptr;
 static HGLRC hRC = nullptr;
+#elif defined(AAE_SDL)
+// The window and its SDL_Window live in sdl_window.cpp; only the context is here.
+static SDL_GLContext gCtx = nullptr;
 #else
 // The X11 display/window LinuxWindow hands us via sys_gl_set_x11_target().
 // This file never opens a display of its own - the dependency runs one way,
@@ -240,6 +247,8 @@ static void ReportOpenGLCapabilities()
 	else {
 		LOG_ERROR("WGL_EXT_swap_control NOT supported");
 	}
+#elif defined(AAE_SDL)
+	LOG_INFO("Swap control: via SDL_GL_SetSwapInterval");
 #else
 	// GLX equivalent, queried directly rather than through GLEW so this does
 	// not depend on glxewInit() having run.
@@ -503,6 +512,87 @@ void glchain_swap_buffers()
 	else {
 		LOG_ERROR("GLSwapBuffers called with null device context");
 	}
+}
+
+#elif defined(AAE_SDL)  // ------------------------------------------------- SDL
+
+// -----------------------------------------------------------------------------
+// InitOpenGLContext (SDL)
+//
+// SdlWindow created the window with SDL_WINDOW_OPENGL and set the profile
+// attributes before creation (macOS needs 3.2 core forward-compatible, which
+// returns its highest core context, 4.1). Here the context is made current
+// and GLEW loaded, as the GLX path does.
+// -----------------------------------------------------------------------------
+bool InitOpenGLContext(bool /*forceLegacyGL2*/, bool enableMultisample, bool /*useCoreProfile*/)
+{
+	SDL_Window* win = sdl_get_window();
+	if (!win) {
+		LOG_ERROR("InitOpenGLContext: no SDL window - SdlWindow::Create must run first");
+		return false;
+	}
+	// A renderer=vulkan session that fell back to OpenGL still has its
+	// Vulkan-only window; swap it for an OpenGL one before making a context.
+	if (!(SDL_GetWindowFlags(win) & SDL_WINDOW_OPENGL)) {
+		if (!sdl_recreate_window_for_opengl() || !(win = sdl_get_window())) {
+			LOG_ERROR("InitOpenGLContext: could not recreate the window for OpenGL");
+			return false;
+		}
+	}
+
+	gCtx = SDL_GL_CreateContext(win);
+	if (!gCtx) {
+		LOG_ERROR("SDL: could not create an OpenGL context: %s", SDL_GetError());
+		return false;
+	}
+	if (SDL_GL_MakeCurrent(win, gCtx) != 0) {
+		LOG_ERROR("SDL: SDL_GL_MakeCurrent failed: %s", SDL_GetError());
+		SDL_GL_DeleteContext(gCtx);
+		gCtx = nullptr;
+		return false;
+	}
+
+	glewExperimental = GL_TRUE;   // required for core profiles
+	GLenum err = glewInit();
+	if (err != GLEW_OK) {
+		LOG_ERROR("GLEW init failed: %s", glewGetErrorString(err));
+		return false;
+	}
+	// A core profile makes glewInit leave a spurious GL_INVALID_ENUM behind.
+	glGetError();
+
+	if (enableMultisample)
+		glEnable(GL_MULTISAMPLE);
+
+	gOpenGLInitialized = true;
+	ReportOpenGLCapabilities();
+	return true;
+}
+
+void DeleteGLContext()
+{
+	if (gCtx) {
+		SDL_GL_MakeCurrent(sdl_get_window(), nullptr);
+		SDL_GL_DeleteContext(gCtx);
+		gCtx = nullptr;
+	}
+	gOpenGLInitialized = false;
+}
+
+void glchain_set_vsync(bool enabled)
+{
+	// Adaptive vsync first where offered, then plain vsync.
+	if (enabled && SDL_GL_SetSwapInterval(-1) == 0) return;
+	if (SDL_GL_SetSwapInterval(enabled ? 1 : 0) != 0)
+		LOG_INFO("SetvSync: SDL could not set the swap interval: %s", SDL_GetError());
+}
+
+void glchain_swap_buffers()
+{
+	if (SDL_Window* win = sdl_get_window())
+		SDL_GL_SwapWindow(win);
+	else
+		LOG_ERROR("GLSwapBuffers called with no SDL window");
 }
 
 #else  // ---------------------------------------------------------------- GLX

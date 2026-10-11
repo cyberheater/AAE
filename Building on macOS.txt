@@ -1,0 +1,43 @@
+Building AAE on macOS
+=====================
+
+The macOS build uses SDL2 for the window, keyboard, mouse, gamepads and
+sound, and OpenGL (Apple's GL 4.1 core) for rendering. It runs natively on
+both Apple Silicon and Intel Macs.
+
+1. Install the tools (Homebrew, https://brew.sh):
+
+     xcode-select --install
+     brew install cmake sdl2 glew
+
+2. Build, from the repository root:
+
+     cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release
+     cmake --build build-mac -j
+
+   The binary lands in build-mac/bin/aae.
+
+3. Make a run folder. AAE reads aae.ini, ini/, artwork/, samples/ and roms/
+   from the folder its binary is in, so copy the shipped runtime folder and
+   put the binary in it:
+
+     cp -R x64/Release ~/AAE
+     rm -f ~/AAE/aae.exe ~/AAE/*.dll
+     cp build-mac/bin/aae ~/AAE/
+
+4. Put ROM zips (MAME names) in ~/AAE/roms, then run:
+
+     cd ~/AAE
+     ./aae starwars        # straight into a game
+     ./aae                 # the game list
+
+Notes
+-----
+- Renderer: OpenGL is the default on macOS. The Vulkan renderer can be tried
+  with "-renderer vulkan" once MoltenVK is installed (brew install molten-vk
+  vulkan-loader shaderc, then rebuild so glslc compiles the shaders); it is
+  untested on macOS.
+- Mouse capture: click in the window to capture the mouse, F9 releases it.
+- Keyboard LEDs (cabinet lamps) do nothing on macOS; the OS gives apps no way
+  to drive them.
+- Sound is stereo through CoreAudio.

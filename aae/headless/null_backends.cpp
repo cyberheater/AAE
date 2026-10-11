@@ -336,3 +336,6 @@ void stream_update(int, short*) {}
 // set_texture_id(), which is already a no-op above; this just gives that
 // call somewhere valid to write to.
 rtex_t game_tex[10] = {};
+int sample_get_volume(int) { return 255; }
+void stream_set_native_rate(int, int) {}
+void stream_start(int, int, int, int) {}

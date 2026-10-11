@@ -106,10 +106,12 @@ extern "C" {
 //#endif
 
 #define bitget(p, m)        ((p) & (m))
-#define bitset(p, m)        ((p) |= (m))
+// Not "bitset": libc++ pulls <bitset> in through <ostream>, and a function-like
+// macro of that name breaks std::bitset's constructors (macOS build).
+#define bit_set(p, m)       ((p) |= (m))
 #define bitclr(p, m)        ((p) &= ~(m))
 #define bitflp(p, m)        ((p) ^= (m))
-#define bit_write(c, p, m)  ((c) ? bitset(p, m) : bitclr(p, m))
+#define bit_write(c, p, m)  ((c) ? bit_set(p, m) : bitclr(p, m))
 
 #ifdef __cplusplus
 }

@@ -46,6 +46,9 @@ For more information, please refer to < https://unlicense.org/>
 #else
 #include <unistd.h>    // readlink
 #include <limits.h>    // PATH_MAX
+#ifdef __APPLE__
+#include <mach-o/dyld.h>   // _NSGetExecutablePath
+#endif
 #endif
 
 // -----------------------------------------------------------------------------
@@ -99,6 +102,20 @@ static std::filesystem::path exe_dir()
 		LOG_INFO("Failed to get the executable path. Error: %lu", GetLastError());
 		return {};
 	}
+	return std::filesystem::path(buf).parent_path();
+#elif defined(__APPLE__)
+	// macOS has no /proc. _NSGetExecutablePath may return a path through a
+	// symlink or with "..", so canonicalise it like readlink does on Linux.
+	char raw[PATH_MAX] = { 0 };
+	uint32_t size = sizeof(raw);
+	if (_NSGetExecutablePath(raw, &size) != 0)
+	{
+		LOG_INFO("Failed to get the executable path from _NSGetExecutablePath");
+		return {};
+	}
+	char buf[PATH_MAX] = { 0 };
+	if (!realpath(raw, buf))
+		return std::filesystem::path(raw).parent_path();
 	return std::filesystem::path(buf).parent_path();
 #else
 	char buf[PATH_MAX] = { 0 };

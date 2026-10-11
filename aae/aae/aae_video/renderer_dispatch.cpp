@@ -32,6 +32,11 @@ static int s_active = RENDERER_OPENGL;
 // (one per game load) do not retry Vulkan or re-show the fallback popup.
 static int s_vulkanFailed = 0;
 
+// For a window layer that already knows Vulkan cannot run (the SDL/macOS
+// build when no Vulkan runtime is installed): every init_gl() then goes
+// straight to OpenGL, without an attempt or the fallback popup.
+void renderer_disable_vulkan(void) { s_vulkanFailed = 1; }
+
 // Which chain actually runs this session (post-fallback), for the consumers
 // that must branch on it (artwork loaders, snapshot path, VectorFont).
 int active_renderer(void) { return s_active; }

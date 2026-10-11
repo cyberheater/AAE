@@ -170,7 +170,14 @@ set(AAE_CORE_SOURCES
     aae/aae/sndhrdwr/starwars_snd.cpp
     aae/aae/sndhrdwr/tms36xx.cpp
     aae/aae/sndhrdwr/tms5220.cpp
-    aae/aae/vidhrdwr/aae_avg.cpp
+    aae/aae/vidhrdwr/mame_late_avgdvg.cpp
+    aae/aae/sndhrdwr/c012294.c
+    aae/aae/drivers/mario.cpp
+    aae/aae/drivers/mpatrol.cpp
+    aae/aae/drivers/williams.cpp
+    aae/aae/sndhrdwr/hc55516.cpp
+    aae/aae/sndhrdwr/irem_snd.cpp
+    aae/aae/sndhrdwr/msm5205.cpp
     aae/aae/vidhrdwr/fuzz_state.cpp
     aae/aae/vidhrdwr/mame_vector.cpp
     aae/aae/vidhrdwr/centiped_vid.cpp
@@ -187,8 +194,8 @@ set(AAE_CORE_SOURCES
     aae/aae/vidhrdwr/xevious_video.cpp
 )
 list(LENGTH AAE_CORE_SOURCES _aae_core_count)
-if(NOT _aae_core_count EQUAL 102)
-    message(FATAL_ERROR "aae_core source list has ${_aae_core_count} entries, expected 102 - it has drifted from aae/aae_core.vcxproj")
+if(NOT _aae_core_count EQUAL 112)
+    message(FATAL_ERROR "aae_core source list has ${_aae_core_count} entries, expected 112 - it has drifted from aae/aae_core.vcxproj")
 endif()
 
 # -----------------------------------------------------------------------------
@@ -277,6 +284,16 @@ set(AAE_COMMON_SOURCES
 # what aae.vcxproj builds and is known-good there - and Linux links the system
 # libGLEW instead. This is why glew.c is per-platform rather than in
 # AAE_COMMON_SOURCES.
+if(APPLE)
+    set(_aae_sdl_default ON)
+else()
+    set(_aae_sdl_default OFF)
+endif()
+option(AAE_USE_SDL "Build the SDL2 window/input/audio back-ends (always on for macOS)" ${_aae_sdl_default})
+if(APPLE AND NOT AAE_USE_SDL)
+    message(FATAL_ERROR "macOS builds use the SDL2 back-ends; AAE_USE_SDL cannot be OFF")
+endif()
+
 if(WIN32)
     set(AAE_PLATFORM_SOURCES
         aae/system/3rdparty/glew.c
@@ -315,6 +332,39 @@ if(WIN32)
     list(APPEND AAE_PLATFORM_LIBS
         "${AAE_XAUDIO2_LIB_DIR}/xaudio2_9redist.lib"
         "${AAE_XAUDIO2_LIB_DIR}/xapobaseredist.lib")
+elseif(AAE_USE_SDL)
+    # SDL2 back-ends: window + GL context, keyboard/mouse, gamepads, audio.
+    # The only route on macOS; on Linux it is opt-in (-DAAE_USE_SDL=ON) and
+    # exists so the SDL code can be built and run on a Linux box.
+    set(AAE_PLATFORM_SOURCES
+        aae/system/sdl/sdl_main.cpp
+        aae/system/sdl/sdl_window.cpp
+        aae/system/sdl/sdl_input.cpp
+        aae/system/sdl/sdl_joystick.cpp
+        aae/system/sdl/sdl_audio_backend.cpp
+        aae/system/util/linux/posix_timer.cpp
+        aae/system/audio/voice_mixer.cpp
+        aae/system/audio/linux/audio_3d_null.cpp
+        aae/system/input/pad_map.cpp
+    )
+    set(AAE_PLATFORM_DEFINES AAE_SDL)
+    if(APPLE)
+        # Apple marks OpenGL deprecated; it still ships and works (GL 4.1 core).
+        list(APPEND AAE_PLATFORM_DEFINES GL_SILENCE_DEPRECATION)
+    endif()
+    find_package(SDL2 REQUIRED)
+    find_package(OpenGL REQUIRED)
+    find_package(GLEW REQUIRED)
+    set(AAE_PLATFORM_LIBS SDL2::SDL2 OpenGL::GL GLEW::GLEW)
+    # gluBuild2DMipmaps, on the legacy-GL texture path only. macOS ships GLU
+    # inside OpenGL.framework, so OpenGL::GL already covers it there.
+    if(TARGET OpenGL::GLU)
+        list(APPEND AAE_PLATFORM_LIBS OpenGL::GLU)
+    endif()
+    if(NOT APPLE)
+        list(APPEND AAE_PLATFORM_LIBS pthread dl)
+    endif()
+    set(_aae_missing_backends "")
 elseif(UNIX AND NOT APPLE)
     # Linux backend - files do not exist yet; Phase 3b creates them. Listed
     # here so the structure is settled and 3b only fills in bodies.
@@ -438,7 +488,7 @@ elseif(UNIX AND NOT APPLE)
         list(APPEND AAE_PLATFORM_LIBS GLEW::GLEW)
     endif()
 else()
-    message(FATAL_ERROR "Unsupported platform - AAE targets Windows and Linux only")
+    message(FATAL_ERROR "Unsupported platform - AAE targets Windows, Linux and macOS")
 endif()
 
 list(LENGTH AAE_COMMON_SOURCES _aae_common_count)
@@ -535,7 +585,7 @@ endif()
 # That is exactly how the first hermetic build of this project failed. Anything
 # that ONLY aae needs is checked here instead, in the same shape as the ALSA
 # check aae_audiotest already has.
-if(UNIX AND NOT APPLE AND NOT AAE_EXCLUDE_FROM_ALL)
+if(UNIX AND NOT APPLE AND NOT AAE_USE_SDL AND NOT AAE_EXCLUDE_FROM_ALL)
     if(NOT GLEW_FOUND)
         message(FATAL_ERROR
             "The 'aae' target needs GLEW, which was not found.\n"
@@ -575,9 +625,14 @@ add_executable(aae ${AAE_EXCLUDE_FROM_ALL} ${AAE_COMMON_SOURCES} ${AAE_PLATFORM_
 # The Windows solution build already outputs to x64/Release for exactly this
 # reason. Matching it keeps both platforms on one rule instead of needing a
 # launcher workaround.
-if(UNIX AND NOT APPLE)
+if(UNIX AND NOT APPLE AND NOT AAE_USE_SDL)
     set_target_properties(aae PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/x64/Release")
+elseif(AAE_USE_SDL)
+    # In the build tree, not over the tracked Linux binary in x64/Release.
+    # Run it from a copy of x64/Release (see "Building on macOS.txt").
+    set_target_properties(aae PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()
 
 if(WIN32)
@@ -623,6 +678,9 @@ target_include_directories(aae PRIVATE
 
 if(WIN32)
     target_include_directories(aae PRIVATE ${AAE_XAUDIO2_INCLUDE_DIR})
+endif()
+if(AAE_USE_SDL)
+    target_include_directories(aae PRIVATE aae/system aae/system/sdl)
 endif()
 
 target_compile_definitions(aae PRIVATE
@@ -688,6 +746,9 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
 elseif(MSVC)
     target_link_libraries(aae PRIVATE aae_core ${AAE_PLATFORM_LIBS})
     target_link_options(aae PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:aae_core>")
+elseif(APPLE)
+    # Apple ld has no --whole-archive; -force_load is its equivalent.
+    target_link_libraries(aae PRIVATE -Wl,-force_load,$<TARGET_FILE:aae_core> aae_core ${AAE_PLATFORM_LIBS})
 else()
     # GNU ld / Clang: bracket just aae_core so its transitive dependencies
     # (OpenGL/ALSA/X11/pthread/dl) are not also force-included.
@@ -856,6 +917,7 @@ add_executable(aae_headless
     aae/headless/null_backends.cpp
     aae/aae/drivers/asteroid.cpp
     aae/aae/drivers/bzone.cpp
+    aae/aae/drivers/starwars.cpp
     aae/system/3rdparty/miniz.c)
 target_link_libraries(aae_headless PRIVATE aae_core)
 # NOTE: no aae_video, no system/window (only its header, for NullWindow), no
@@ -929,6 +991,7 @@ else()
         aae/system/audio/linux/audio_3d_null.cpp)
 endif()
 
+if(NOT AAE_USE_SDL)
 add_executable(aae_audiotest ${AAE_AUDIOTEST_SOURCES})
 
 target_compile_features(aae_audiotest PRIVATE cxx_std_17)
@@ -965,6 +1028,7 @@ else()
     target_include_directories(aae_audiotest PRIVATE aae/system/audio/linux)
     target_link_libraries(aae_audiotest PRIVATE ALSA::ALSA pthread)
 endif()
+endif() # NOT AAE_USE_SDL
 
 # =============================================================================
 # aae_uinput_test - synthetic input devices for the evdev backend (Linux only).

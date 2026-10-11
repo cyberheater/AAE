@@ -71,14 +71,14 @@ READ_HANDLER(IN0read)
 	// boundaries; add the in-slice cycle count (get6502ticks(0), reset each
 	// slice by cpu_exec_now) so edge-waiting loops (self-test) see a real
 	// ~3KHz square wave. Same fix as llander_IN0_r.
-	if ((get_eterna_ticks(0) + m_cpu_6502[CPU0]->get6502ticks(0)) & 0x100) { bitset(val, 0x80); }
+	if ((get_eterna_ticks(0) + m_cpu_6502[CPU0]->get6502ticks(0)) & 0x100) { bit_set(val, 0x80); }
 	if (!avgdvg_done())
 	{
 		bitclr(val, 0x40);
 	}
 	else
 	{
-		bitset(val, 0x40);
+		bit_set(val, 0x40);
 	}
 
 	return val;

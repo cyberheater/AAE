@@ -28,6 +28,13 @@ static void* LoaderOpen(void)
 {
 #ifdef _WIN32
 	return (void*)LoadLibraryA("vulkan-1.dll");
+#elif defined(__APPLE__)
+	// The Vulkan loader from the LunarG SDK or Homebrew (vulkan-loader), else
+	// MoltenVK directly, which is itself a complete ICD-less driver.
+	void* m = dlopen("libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+	if (!m) m = dlopen("libvulkan.dylib", RTLD_NOW | RTLD_LOCAL);
+	if (!m) m = dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
+	return m;
 #else
 	return dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -580,6 +587,23 @@ bool VK_Init(VkContext& ctx, IPresentSurface& present, bool enableValidation, bo
 
 	VkInstanceCreateInfo ici{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
 	ici.pApplicationInfo = &ai;
+#ifdef __APPLE__
+	// MoltenVK is a "portability" implementation: the loader hides it unless
+	// the instance opts in to enumerating such devices.
+	{
+		PFN_vkEnumerateInstanceExtensionProperties enumExts =
+			(PFN_vkEnumerateInstanceExtensionProperties)ctx.vkGetInstanceProcAddr_(nullptr, "vkEnumerateInstanceExtensionProperties");
+		uint32_t n = 0;
+		if (enumExts) enumExts(nullptr, &n, nullptr);
+		std::vector<VkExtensionProperties> avail(n);
+		if (n > 0) enumExts(nullptr, &n, avail.data());
+		if (HasExtension(avail, "VK_KHR_portability_enumeration"))
+		{
+			instExts.push_back("VK_KHR_portability_enumeration");
+			ici.flags |= 0x00000001; // VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR
+		}
+	}
+#endif
 	ici.enabledExtensionCount = (uint32_t)instExts.size();
 	ici.ppEnabledExtensionNames = instExts.data();
 	ici.enabledLayerCount = (uint32_t)instLayers.size();
@@ -719,10 +743,21 @@ bool VK_Init(VkContext& ctx, IPresentSurface& present, bool enableValidation, bo
 	qci.queueCount = 1;
 	qci.pQueuePriorities = &prio;
 
-	const char* devExts[] =
+	std::vector<const char*> devExtList = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+#ifdef __APPLE__
+	// Required by the spec whenever the device advertises it (MoltenVK does).
 	{
-		VK_KHR_SWAPCHAIN_EXTENSION_NAME
-	};
+		PFN_vkEnumerateDeviceExtensionProperties enumDevExts =
+			(PFN_vkEnumerateDeviceExtensionProperties)ctx.vkGetInstanceProcAddr_(ctx.instance, "vkEnumerateDeviceExtensionProperties");
+		uint32_t n = 0;
+		if (enumDevExts) enumDevExts(ctx.phys, nullptr, &n, nullptr);
+		std::vector<VkExtensionProperties> avail(n);
+		if (n > 0) enumDevExts(ctx.phys, nullptr, &n, avail.data());
+		if (HasExtension(avail, "VK_KHR_portability_subset"))
+			devExtList.push_back("VK_KHR_portability_subset");
+	}
+#endif
+	const char* const* devExts = devExtList.data();
 
 	// Vulkan 1.3 features the engine records with. BOTH must be explicitly
 	// enabled: using vkCmdPipelineBarrier2 / vkQueueSubmit2 without the
@@ -739,7 +774,7 @@ bool VK_Init(VkContext& ctx, IPresentSurface& present, bool enableValidation, bo
 	dci.pNext = &dr;
 	dci.queueCreateInfoCount = 1;
 	dci.pQueueCreateInfos = &qci;
-	dci.enabledExtensionCount = (uint32_t)(sizeof(devExts) / sizeof(devExts[0]));
+	dci.enabledExtensionCount = (uint32_t)devExtList.size();
 	dci.ppEnabledExtensionNames = devExts;
 
 	LOG_INFO("VK_Init: loading vkCreateDevice");

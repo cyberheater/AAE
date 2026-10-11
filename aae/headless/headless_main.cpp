@@ -45,7 +45,8 @@
 // ---------------------------------------------------------------------------
 static long g_vector_count = 0;
 
-void add_line(float, float, float, float, int, rgb_t) { ++g_vector_count; }
+static FILE* g_dump = nullptr; static int g_frame = 0;
+void add_line(float sx, float sy, float ex, float ey, int in, rgb_t c) { ++g_vector_count; if (g_dump) std::fprintf(g_dump, "%d %g %g %g %g %d %u\n", g_frame, sx, sy, ex, ey, in, (unsigned)c); }
 void add_tex(float, float, int, rgb_t) {}
 void cache_clear() {}
 void set_texture_id(rtex_t*) {}
@@ -80,12 +81,6 @@ void set_shot_texture_ready(bool) {}
 // hardware emulation in aae_avg.cpp is producing real vector output with
 // nothing attached to consume it.
 // ---------------------------------------------------------------------------
-void vector_add_point(int x, int y, unsigned int color, int intensity)
-{
-	add_line((float)x, (float)y, (float)x, (float)y, intensity, (rgb_t)color);
-}
-void vector_add_clip(int, int, int, int) {}
-void vector_clear_list() {}
 
 // ---------------------------------------------------------------------------
 // init_machine_headless
@@ -218,6 +213,9 @@ int main(int argc, char** argv)
 		cpu_run();
 		if (drv->run_game)
 			drv->run_game();
+		g_frame = frame;
+		if (!g_dump && std::getenv("AAE_DUMP")) g_dump = std::fopen(std::getenv("AAE_DUMP"), "w");
+		vector_update();
 		inputport_vblank_end();
 		cpu_clear_cyclecount_eof();
 	}

@@ -1,0 +1,411 @@
+//==========================================================================
+// AAE - Another Arcade Emulator
+// Copyright (C) 2026 Tim Cottrill - GNU GPL v3 or later.
+//==========================================================================
+//==============================================================================
+// sdl_main.cpp -- the SDL2 counterpart of winmain.cpp and linux_main.cpp,
+// used for the macOS build. Same structure as linux_main.cpp: entry point,
+// GetSystemWindow()/GetWindowSetup(), and the pump/poll/run main loop.
+//==============================================================================
+#include "sys_window.h"
+#include "sdl/sdl_window.h"
+
+#include "sys_gl.h"
+#include "sys_timer.h"
+#include "sys_log.h"
+#include "iniFile.h"
+#include "path_helper.h"
+#include "joystick.h"
+#include "sdl/sdl_input.h"
+#include "aae_mame_driver.h"   // the global `done` - ESC sets it, see the loop
+
+#include <SDL.h>
+
+#include <chrono>   // frame-pacing instrumentation in main()
+#include <cmath>    // lroundf - aspect sizing below
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
+// Emulator entry points (aae_emulator.cpp)
+// opengl_renderer.h - declared here rather than including that header,
+// which drags in GL and the whole renderer surface for one function.
+void emulator_on_window_resize(int newW, int newH);
+void renderer_disable_vulkan(void);   // renderer_dispatch.cpp
+
+void emulator_init(int argc, char** argv);
+void emulator_run();
+void emulator_end();
+bool emulator_apply_pending_switch();
+
+// osdepend.h
+void osd_led_service_start();
+void osd_led_service_stop();
+
+//------------------------------------------------------------------------------
+// The single window and its setup, matching winmain.cpp's ownership model.
+//
+// winmain.cpp keeps TWO WindowSetup instances - the live one and a windowed
+// fallback snapshot for ALT+ENTER restore. That distinction is a Win32
+// style/exstyle concern; EWMH fullscreen restores the previous geometry itself,
+// so one instance is correct here.
+//------------------------------------------------------------------------------
+static WindowSetup g_windowSetup;
+
+// MoltenVK's Vulkan path is untested, so macOS starts on OpenGL unless
+// aae.ini or -renderer asks for Vulkan.
+#ifdef __APPLE__
+static const char* kDefaultRenderer = "opengl";
+#else
+static const char* kDefaultRenderer = "vulkan";
+#endif
+static SdlWindow g_window;
+
+WindowSetup& GetWindowSetup()   { return g_windowSetup; }
+ISystemWindow& GetSystemWindow() { return g_window; }
+
+//------------------------------------------------------------------------------
+// The two windows_util.h entry points that portable code calls. Their Win32
+// versions live in system/window/windows_util.cpp; these are the Linux halves.
+//------------------------------------------------------------------------------
+
+// aae_emulator.cpp calls this when a game's aspect ratio is known.
+//
+// The Win32 version also RESIZES the window; this one does not - under a
+// compositor the window manager owns geometry, and a client that fights it
+// produces a flickering resize loop. The renderer letterboxes to the requested
+// aspect inside whatever client area it is given, so the visible result is the
+// same. What must NOT be skipped is the viewport re-fit below.
+void WindowUtil_UpdateAspect(float gameAspect)
+{
+	if (gameAspect <= 0.0f) return;
+
+	// Storing the aspect and re-fitting screen_rect is the part that MATTERS -
+	// not the window resize. screen_rect is built once inside init_gl's
+	// init_one guard, so emulator_on_window_resize is the only thing that
+	// re-fits it for a new game; without this call, a game launched from the
+	// GUI renders with the GUI's fit.
+	GetWindowSetup().aspectRatio = gameAspect;
+	emulator_on_window_resize(GetWindowSetup().clientWidth,
+	                          GetWindowSetup().clientHeight);
+
+	LOG_INFO("WindowUtil_UpdateAspect(%.4f): aspect stored and viewport re-fitted; "
+	         "the window itself is left to the WM on this platform", gameAspect);
+}
+
+// Message box equivalent. There is no portable dialog here and AAE has no
+// toolkit dependency, so this logs at error level - which is visible on the
+// console and in systemlog.txt - rather than silently swallowing the message.
+void allegro_message(const char* title, const char* message)
+{
+	LOG_ERROR("%s: %s", title ? title : "MESSAGE", message ? message : "");
+	fprintf(stderr, "%s: %s\n", title ? title : "MESSAGE", message ? message : "");
+}
+
+int main(int argc, char** argv)
+{
+	Log::open("systemlog.txt");
+	// Build stamp. Without one, "am I running the build you just gave me?"
+	// could only be answered by grepping the binary for strings that happened
+	// to be new - which wasted a round trip on a 300MB bundle.
+	LOG_INFO("AAE starting (SDL2) - built %s %s", __DATE__, __TIME__);
+
+	SetIniFile(getpathM(nullptr, "aae.ini").c_str());
+
+	// Window geometry: fallback values only. The real default is computed from
+	// the screen size below - full size at the configured aspect, centered -
+	// matching what winmain.cpp's windowed startup produces on Windows.
+	g_windowSetup.windowWidth  = 1024;
+	g_windowSetup.windowHeight = 768;
+	g_windowSetup.centerWindow = true;
+
+	// Aspect for the default window, same [window] aspect_ratio key winmain.cpp
+	// reads, same 4:3 fallback.
+	{
+		std::string aspect = get_config_string("window", "aspect_ratio", "4:3");
+		int ax = 0, ay = 0;
+		if (sscanf(aspect.c_str(), "%d:%d", &ax, &ay) != 2 || ax <= 0 || ay <= 0) {
+			LOG_INFO("Invalid aspect ratio: %s - defaulting to 4:3", aspect.c_str());
+			ax = 4; ay = 3;
+		}
+		g_windowSetup.aspectRatio = (float)ax / (float)ay;
+	}
+
+	// Mouse capture: ALWAYS on at startup, matching winmain.cpp. The cursor_clip
+	// ini key and -clip/-noclip switches are deliberately not consulted - a stale
+	// cursor_clip=0 made sessions start with a visible, unconfined pointer, and
+	// capture-by-default with no exceptions is the product decision (2026-07-29).
+	// F9 releases at runtime and a click on the window recaptures.
+	//
+	// Set BEFORE Create(), which seeds its own capture state from WindowSetup.
+	g_windowSetup.cursorClipEnabled = true;
+
+	// Explicit window size, same [main] screenw/screenh contract as Windows:
+	// both positive = exact client size, 0 (the default) = AUTO, which keeps
+	// the computed work-area fit below. The WM may still clamp what we ask for.
+	const int cfgScreenW = get_config_int("main", "screenw", 0);
+	const int cfgScreenH = get_config_int("main", "screenh", 0);
+	const bool explicitSize = (cfgScreenW > 0 && cfgScreenH > 0);
+	// This platform's WindowUtil_UpdateAspect never resizes the window, but
+	// keep the shared contract's flag truthful all the same.
+	g_windowSetup.explicitWindowSize = explicitSize;
+
+	// screenRect is the primary monitor's pixel size. run_game() reads it to
+	// sanity-check the configured resolution, so it must be populated before
+	// emulator_init - winmain.cpp fills it from GetSystemMetrics at the same
+	// point. SDL reports the usable area minus the menu bar and Dock.
+	if (SDL_InitSubSystem(SDL_INIT_VIDEO) == 0) {
+		SDL_Rect full{}, usable{};
+		SDL_GetDisplayBounds(0, &full);
+		if (SDL_GetDisplayUsableBounds(0, &usable) != 0) usable = full;
+		g_windowSetup.screenRect.left   = 0;
+		g_windowSetup.screenRect.top    = 0;
+		g_windowSetup.screenRect.right  = full.w;
+		g_windowSetup.screenRect.bottom = full.h;
+		const long workW = usable.w;
+		const long workH = usable.h;
+
+		if (explicitSize) {
+			g_windowSetup.windowWidth  = cfgScreenW;
+			g_windowSetup.windowHeight = cfgScreenH;
+		} else {
+			// Largest window of the game aspect that fits the usable area,
+			// less an allowance for the title bar. Sizes are in points.
+			const int frameAllowance = 32;
+			int clientH = (int)workH - frameAllowance;
+			int clientW = (int)lroundf(clientH * g_windowSetup.aspectRatio);
+			if (clientW > (int)workW) {
+				clientW = (int)workW;
+				clientH = (int)lroundf(clientW / g_windowSetup.aspectRatio);
+			}
+			if (clientW > 0 && clientH > 0) {
+				g_windowSetup.windowWidth  = clientW;
+				g_windowSetup.windowHeight = clientH;
+			}
+		}
+		LOG_INFO("Primary screen: %dx%d, usable area %ldx%ld -> default window %dx%d",
+		         g_windowSetup.screenRect.right, g_windowSetup.screenRect.bottom,
+		         workW, workH,
+		         g_windowSetup.windowWidth, g_windowSetup.windowHeight);
+	} else {
+		LOG_ERROR("SDL video init failed: %s", SDL_GetError());
+	}
+
+	// Startup window mode, from the same [window] fullscreen key the Video menu
+	// writes on save. Applied by Create() below, which requests EWMH fullscreen
+	// only once the window exists - the ordering winmain.cpp had to learn on
+	// Windows too (b7073ae).
+	//
+	// The absence of this read is why fullscreen appeared not to SAVE on Linux.
+	// It saved correctly: ToggleBorderlessFullscreen publishes the live state to
+	// WindowSetup, and menu.cpp persists it to [window] fullscreen. Nothing ever
+	// read it back, so every session started windowed and the setting looked
+	// discarded. Windows was unaffected - winmain.cpp has had this read all along.
+	//
+	// Precedence matches winmain.cpp exactly: [window] fullscreen wins; the
+	// legacy [main] windowed is the fallback (windowed=1 meaning fullscreen=0);
+	// windowed is the safe default when neither key is present.
+	{
+		const int winFullscreen = get_config_int("window", "fullscreen", -1);
+		const int mainWindowed  = get_config_int("main",   "windowed",   -1);
+
+		if (winFullscreen != -1)
+			g_windowSetup.useFullscreen = (winFullscreen != 0);
+		else if (mainWindowed != -1)
+			g_windowSetup.useFullscreen = (mainWindowed == 0);
+		else
+			g_windowSetup.useFullscreen = false;
+
+		// The command line wins over the ini, for front-ends that launch AAE
+		// with an explicit mode. Applied AFTER the ini read and before Create(),
+		// so a switch is a one-launch override that leaves [window] fullscreen
+		// untouched - the same contract ParseCommandLineArgs gives on Windows.
+		//
+		// Only these two of the Win32 window switches are meaningful here.
+		// -clip/-noclip are deliberately inert on this platform (capture is
+		// unconditional, see the note above) and -disableNC is a Win32 style
+		// concern with no X11 counterpart. aae_emulator.cpp's own parser sees
+		// the same argv and ignores tokens it does not recognise, so the two
+		// need no coordination.
+		for (int i = 1; i < argc; ++i) {
+			if (!argv[i]) continue;
+			if      (strcmp(argv[i], "-fullscreen") == 0) g_windowSetup.useFullscreen = true;
+			else if (strcmp(argv[i], "-windowed")   == 0) g_windowSetup.useFullscreen = false;
+		}
+
+		LOG_INFO("Startup window mode: %s",
+		         g_windowSetup.useFullscreen ? "fullscreen" : "windowed");
+	}
+
+	bool wantVulkan = true;
+	{
+		std::string r = get_config_string("main", "renderer", kDefaultRenderer);
+		if (r == "opengl")
+			wantVulkan = false;
+		for (int i = 1; i < argc - 1; ++i) {
+			if (strcmp(argv[i], "-renderer") == 0) {
+				if (strcmp(argv[i + 1], "vulkan") == 0)      wantVulkan = true;
+				else if (strcmp(argv[i + 1], "opengl") == 0) wantVulkan = false;
+			}
+		}
+	}
+
+	g_window.SetUseVulkan(wantVulkan);
+
+	bool windowOk = g_window.Create(g_windowSetup);
+	if (!windowOk && wantVulkan) {
+		// No Vulkan runtime (on macOS: MoltenVK not installed). The shipped
+		// aae.ini says renderer=vulkan, so fall back rather than refuse to run.
+		LOG_INFO("Vulkan window unavailable - falling back to OpenGL");
+		wantVulkan = false;
+		renderer_disable_vulkan();
+		g_window.SetUseVulkan(false);
+		windowOk = g_window.Create(g_windowSetup);
+	}
+	if (!windowOk) {
+		LOG_ERROR("Window creation failed - cannot continue");
+		Log::close();
+		return 1;
+	}
+
+	// Renderer selection, decided EARLY like winmain.cpp's EarlyRendererIsVulkan:
+	// under Vulkan no GLX context is created at all (the dispatch layer routes
+	// every gl*chain call to vkchain, and ViewOrtho is a core-profile no-op, so
+	// nothing touches GL without a context - proven by the Windows VK path,
+	// which has skipped context creation since Plan 2). This also means a GLX
+	// failure can no longer kill a Vulkan session that never needed GL.
+	// Default matches config.cpp: vulkan. The cmdline can override per launch.
+	if (!wantVulkan) {
+		// Core profile, matching winmain.cpp's InitOpenGLContext(false, false, true).
+		if (!InitOpenGLContext(false, false, true)) {
+			LOG_ERROR("OpenGL context creation failed - cannot continue");
+			g_window.Destroy();
+			Log::close();
+			return 1;
+		}
+	} else {
+		LOG_INFO("Renderer=vulkan: window created for a Vulkan surface");
+	}
+
+	g_window.EnableCursorClip(g_windowSetup.cursorClipEnabled);
+	TimerInit();
+
+	// winmain.cpp calls RawInput_Initialize(hwnd) at the equivalent point.
+	// Keyboard and mouse arrive as SDL events through the window's pump.
+	SdlInput_Initialize();
+
+	// Keyboard LEDs stand in for cabinet lamps elsewhere; macOS gives no way
+	// to drive them, so this service is a no-op here.
+	osd_led_service_start();
+
+	install_joystick();
+
+	emulator_init(argc, argv);
+
+	// Frame-pacing instrumentation. Measured rather than guessed at: the
+	// stutter has already survived one fix aimed at a suspected cause, so the
+	// next move is to find out what the frame intervals actually are instead
+	// of proposing a third theory.
+	//
+	// Counters only - no logging in the loop, because a per-frame log is a
+	// plausible cause of the very thing being measured.
+	using DiagClock = std::chrono::steady_clock;
+	auto     lastFrame   = DiagClock::now();
+	auto     runStart    = lastFrame;
+	int64_t  frameCount  = 0;
+	int64_t  hitchCount  = 0;      // frames taking >1.5x the target
+	int64_t  worstUs     = 0;
+	double   hitchSumSec = 0.0;    // for the mean gap BETWEEN hitches
+	double   lastHitchAt = -1.0;
+	int64_t  hitchGaps   = 0;
+
+	bool running = true;
+	while (running) {
+		// Window, keyboard and mouse events first. PumpEvents returns false on quit.
+		if (!g_window.PumpEvents())
+			break;
+
+		// Input is drained here, on the game thread. The Win32 backend does
+		// this on a worker thread because WM_INPUT arrives on the message
+		// pump; sys_input.h notes that is a backend choice, not the contract.
+		poll_joystick();
+		emulator_run();
+
+		{
+			const auto now = DiagClock::now();
+			const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(
+			                       now - lastFrame).count();
+			lastFrame = now;
+			++frameCount;
+
+			// 1.5x of a 60Hz frame. Deliberately generous: this is looking for
+			// the 1-2 frame stalls being reported, not ordinary jitter.
+			if (frameCount > 60 && us > 25000) {
+				++hitchCount;
+				if (us > worstUs) worstUs = us;
+
+				const double at = std::chrono::duration<double>(now - runStart).count();
+				if (lastHitchAt >= 0.0) {
+					hitchSumSec += (at - lastHitchAt);
+					++hitchGaps;
+				}
+				lastHitchAt = at;
+			}
+		}
+
+		if (emulator_apply_pending_switch())
+			continue;
+
+		// THE quit condition, and it was missing.
+		//
+		// ESC does not close the window - it sets the global `done`, after
+		// which emulator_run() returns immediately on every call. winmain.cpp
+		// gates its whole loop on this (`while (!done)`, plus the same check
+		// after a pending switch); this loop only ever broke on
+		// WM_DELETE_WINDOW.
+		//
+		// So pressing ESC left the emulator running here with nothing to do
+		// until the window was closed by hand, which from outside is
+		// indistinguishable from a hang on exit.
+		if (done)
+			break;
+	}
+
+	{
+		const double elapsed = std::chrono::duration<double>(
+		                           DiagClock::now() - runStart).count();
+		LOG_INFO("Frame pacing: %lld frames in %.1fs (%.1f fps avg), %lld hitches "
+		         ">25ms, worst %.1f ms, mean gap between hitches %.2f s",
+		         (long long)frameCount, elapsed,
+		         elapsed > 0.0 ? (double)frameCount / elapsed : 0.0,
+		         (long long)hitchCount, (double)worstUs / 1000.0,
+		         hitchGaps ? hitchSumSec / (double)hitchGaps : 0.0);
+	}
+
+	// Breadcrumbs through teardown. A hang on exit leaves no window, no error
+	// and no stack - just a process that will not die - and the only thing
+	// that distinguishes "the audio thread will not join" from "GL teardown
+	// blocked" is which of these was the last line written. Seven lines at
+	// shutdown cost nothing and turn a force-kill into a diagnosis.
+	LOG_INFO("Shutdown: emulator_end...");
+	emulator_end();
+	LOG_INFO("Shutdown: remove_joystick...");
+	remove_joystick();
+	LOG_INFO("Shutdown: input...");
+	RawInput_Shutdown();
+	LOG_INFO("Shutdown: led service...");
+	osd_led_service_stop();
+	LOG_INFO("Shutdown: timer...");
+	TimerShutdown();
+	LOG_INFO("Shutdown: GL context...");
+	DeleteGLContext();
+	LOG_INFO("Shutdown: window...");
+	g_window.Destroy();
+	SDL_Quit();
+	LOG_INFO("Shutdown: complete");
+	Log::close();
+
+	LOG_INFO("AAE exiting");
+	return 0;
+}
