@@ -68,6 +68,7 @@
 #include "osd_video.h"
 #include "FrameLimiter.h"
 #include "driver_registry.h"   // AllDrivers(), FindDriverByName(), AAE_REGISTER_DRIVER
+#include "iniFile.h"           // get_config_string - [main] default_game
 #include "joystick.h"
 #include "mame_layout.h"
 #ifdef _WIN32
@@ -1884,7 +1885,28 @@ void emulator_init(int argc, char** argv)
 	}
 	else
 	{
-		LOG_INFO("No game on command line -> starting GUI (gamenum=%d).", gamenum);
+		// Optional [main] default_game: with no game on the command line, start
+		// this game directly instead of the GUI. Empty or unknown means GUI.
+		const char* def = get_config_string("main", "default_game", "");
+		std::string defName = def ? to_lowercase(def) : std::string();
+		if (!defName.empty())
+		{
+			for (int i = 0; i < num_games; ++i)
+			{
+				if (reg[i] && reg[i]->name && defName == reg[i]->name)
+				{
+					gamenum = i;
+					started_from_command_line = 1;
+					break;
+				}
+			}
+		}
+		if (started_from_command_line)
+			LOG_INFO("No game on command line -> starting default_game '%s'.", defName.c_str());
+		else if (!defName.empty())
+			LOG_INFO("Unknown default_game '%s' -> starting GUI.", defName.c_str());
+		else
+			LOG_INFO("No game on command line -> starting GUI (gamenum=%d).", gamenum);
 	}
 
 	// gameparse() handles -listroms, -verifyroms, resolution overrides, etc.
